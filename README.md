@@ -1,5 +1,3 @@
-# tlao-public
-
 # Learning Representations of Object Motion from Agent Action
 
 This repository contains analysis materials for the project 'Learning representations of object motion from agent action', by Joseph Outa and Shari Liu.
