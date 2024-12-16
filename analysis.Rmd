@@ -1,0 +1,646 @@
+---
+title: "tlao-main-iCatcher"
+author: "Joseph Outa"
+date: "2024-02-23"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 4
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+library(pacman)
+pacman::p_load(
+               tidyverse,
+               here,
+               bookdown,
+               lmerTest,
+               performance
+               )
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+options(scipen = 1, digits = 3)
+sessionInfo()
+library(plotly)
+
+```
+
+## Read and clean data
+
+```{r, message = FALSE}
+here()
+d_icatcher_raw <- read_csv(here("analysis_data/FULLSTUDY_processed_lookdata_byTrial-0920.csv")) %>% 
+  mutate(Log_looks = log(Looks.duration_onLooks))
+
+#raed pyhab data. Only need for sanity check + grabbing age data
+directory_path <- here("analysis_data/trial_info")
+file_paths <- list.files(path = directory_path, pattern = "^sub-.*\\_trialCondition.csv$", full.names = TRUE) 
+
+d_pyhab <- map_df(file_paths, ~ {read_csv(.x, col_types = cols(
+  sex = col_character())) %>% # otherwise sex treated as logical due to 'F'
+    mutate(filename = str_remove(basename(.x), "_trialCondition.csv"))  %>% 
+    mutate(sID = str_replace(sID, "sub-LIU_TLAO_", "")) %>% #first standardize all sIDs to be short (some are short, some are long)
+    mutate(sID = paste0("sub-LIU_TLAO_", sID)) %>% #then lengthen them all
+    mutate(sID_equals_filename = sID == filename)  %>% # Check if sID and filename are equal (for data entry errors)
+    mutate(sID = if_else(!sID_equals_filename, filename, sID))  %>% # Replace sID with filename if not equal
+    mutate(months = case_when(sID == "sub-LIU_TLAO_s044" & months == -5 ~ 6, #fix erroneous months of births 
+                            sID == "sub-LIU_TLAO_s053" & months == -5 ~ 6,
+                            TRUE ~ months)) }) 
+
+```
+
+pre-exclusion N and age
+
+- N = 57 (tested, if went past setup and showed some parts of stimuli)
+- mean age = 6.55 months
+
+```{r}
+d_icatcher_raw %>% 
+  left_join(d_pyhab %>% 
+              select(sID, months, condLabel) %>% 
+              distinct(sID, .keep_all = TRUE) %>%  # Keep only unique rows by sID
+              rename(SubjectInfo.subjID = "sID"), 
+              by = "SubjectInfo.subjID") %>% 
+  relocate(months, .after = "SubjectInfo.subjID") %>% 
+  mutate(months = ifelse(SubjectInfo.subjID == "sub-LIU_TLAO_s032", 8, months)) %>% 
+  mutate(months = ifelse(SubjectInfo.subjID == "sub-LIU_TLAO_s070", 8, months)) %>% 
+  summarize(mean_age = mean(months))
+```
+
+# Data quality checks, fixes, exclusions
+
+# fix s085 
+
+- s085 was erroneously coded as having LT of 0.0 by icatcher, grabbed and imputed correct data from pyhab coding (confirmed figure)
+
+```{r}
+#filter d_icatcher_raw_candidates 
+d_icatcher_raw_candidates <- d_icatcher_raw %>%
+  filter(Looks.duration_onLooks == 0.0) %>%
+  select(-SubjectInfo.sessionNumber) %>%
+  filter(Trials.trialType == "test") %>% 
+  filter(SubjectInfo.subjID == "sub-LIU_TLAO_s085") #checked each one manually, and s085 s the only one who's LT is erroneously coded as 0 by icatcher. s036 looked for < 3s total, and s029, s055, s059, and s085 were looking away during Attention grabber
+
+#prepare the data from d_pyhab for matching and imputation
+d_pyhab_filtered <- d_pyhab %>%
+  rename(SubjectInfo.subjID = sID, Trials.ordinal = trial, Looks.duration_onLooks = sumOnA) %>%  # Renaming to match
+  filter(GNG == 1) %>%
+  semi_join(d_icatcher_raw_candidates, by = c("SubjectInfo.subjID", "Trials.ordinal")) %>%
+  select(SubjectInfo.subjID, Trials.ordinal, Looks.duration_onLooks)
+
+#update the values in d_icatcher_raw
+d_icatcher_raw_updated <- d_icatcher_raw %>%
+  left_join(d_pyhab_filtered, by = c("SubjectInfo.subjID", "Trials.ordinal")) %>%
+  mutate(Looks.duration_onLooks = if_else(Looks.duration_onLooks.x == 0.0, Looks.duration_onLooks.y, Looks.duration_onLooks.x)) %>%
+  select(-Looks.duration_onLooks.x, -Looks.duration_onLooks.y)  # Clean up temporary columns
+
+#add back in! 
+d_icatcher <- d_icatcher_raw_updated
+
+```
+
+## Trial Exclusions and Subject Exclusions
+
+subjects excluded (20):
+- technical difficulties (5):  s028, s029, s030, s042, s078 (i.e. stimuli didn't loop, pyhab keeps freezing, no sound, )
+- experimenter error (2): s035, s064 (forgetting to record shared screen, not recording session)
+- inattention (4): s039, s053, s058, s073
+- poor video quality (1): s043
+- external distraction (3): s068, s069, s075 (siblings, caregiver)
+- trial exclusions resulting in no trials left/accumulated looking time less than 3 seconds (5): s038, s049, s062, s067, s071 (and thus had to exclude non-consecutive test trials)
+
+
+```{r}
+# trial exclusions. Based on speedwatching + icatcher exclusion criteria
+d_icatcher_trials_excluded <- d_icatcher %>% 
+    filter(is.na(Trials.excludeReason)) %>% #if reason given by icatcher, exclude (NB: removes LTs <= 3, among others)
+    filter(!is.na(Looks.duration_onLooks)) #inspected all NAs
+
+
+d_icatcher_test_trials_excluded <- d_icatcher_trials_excluded %>% 
+  filter(!SubjectInfo.subjID %in% c("sub-LIU_TLAO_s029", "sub-LIU_TLAO_s038", "sub-LIU_TLAO_s039", "sub-LIU_TLAO_s049",
+                                    "sub-LIU_TLAO_s062", "sub-LIU_TLAO_s067", "sub-LIU_TLAO_s069",  "sub-LIU_TLAO_s071")) %>% 
+  filter(!Looks.duration_onLooks <= 3) #for some reason icatcher did not exclude many of these guys
+
+# Excluded subjects:
+#s029 had technical difficulties
+#s038 has only 2 remaining test trials and both are "unexp-flip"
+#s039 nonconsecutive remaining trials: trial 11(exp-flip) and trial 14 (unexp-flip)
+#s049 nonconsecutive remaining trials: trial 11(exp-flip) and trial 14 (unexp-flip)
+#s062 has only 1 test trial remaining
+#s067 3 remaining test trials (last pair), trial 11 (unexp), trial 13 (unexp) and trial 14 (exp). Excluding whole participant
+#s069 remaining test trials are last 2: trial 13 (exp-flip) and trial 14 (unexp-flip). Excluding whole participant
+#s071 has 0 test trials remaining after exclusions
+
+# Did not exclude, but worth discussing = Subjects with 3 remaining test trials (at least 2 are consecutive):
+#s034: 11 exp, 12 unexp, 14 unexp
+#s036: 11 exp, 12 unexp, 13 exp
+#s054: 11 unexp-flip, 12 exp-flip, 13 unexp-flip
+#s056: 11 unexp, 12 exp, 14 exp
+#s059: 11 unexp, 12 exp, 13 unexp
+#s060: 11 unexp-flip, 12 exp-flip, 13 unexp-flip
+#s083: 11 exp-flip, 12 unexp-flip, 14 unexp-flip
+#s075: 11, 12, 14 
+
+# If we exclude triplets and only remained with pairs: (no difference to outcome):
+# d_icatcher_test_trials_excluded <- d_icatcher_test_trials_excluded %>%
+#   filter(!(SubjectInfo.subjID == "sub-LIU_TLAO_s034" & Trials.ordinal == "14")) %>%
+#   filter(!(SubjectInfo.subjID == "sub-LIU_TLAO_s036" & Trials.ordinal == "13")) %>%
+#   filter(!(SubjectInfo.subjID == "sub-LIU_TLAO_s054" & Trials.ordinal == "13")) %>%
+#   filter(!(SubjectInfo.subjID == "sub-LIU_TLAO_s056" & Trials.ordinal == "14")) %>%
+#   filter(!(SubjectInfo.subjID == "sub-LIU_TLAO_s059" & Trials.ordinal == "13")) %>%
+#   filter(!(SubjectInfo.subjID == "sub-LIU_TLAO_s060" & Trials.ordinal == "13")) %>%
+#   filter(!(SubjectInfo.subjID == "sub-LIU_TLAO_s075" & Trials.ordinal == "14")) %>%
+#   filter(!(SubjectInfo.subjID == "sub-LIU_TLAO_s083" & Trials.ordinal == "14"))
+
+```
+
+
+## Wrangle data for plotting
+
+```{r, fig.width = 10}
+d_icatcher_plot <-  d_icatcher_test_trials_excluded %>%
+  #add age
+  left_join(d_pyhab %>%
+              select(sID, months, days, condLabel, sex) %>%
+              distinct(sID, .keep_all = TRUE) %>%  #
+              rename(SubjectInfo.subjID = "sID"),
+            by = "SubjectInfo.subjID") %>%
+  mutate(months = ifelse(SubjectInfo.subjID == "sub-LIU_TLAO_s032", 8, months)) %>%
+  mutate(months = ifelse(SubjectInfo.subjID == "sub-LIU_TLAO_s070", 8, months)) %>%
+  filter(!months > 8) %>%  #exclude one 9-month-old
+  mutate(age_months_decimal = months + (days / 30.44)) %>%
+  mutate(age_median = median(age_months_decimal, na.rm = TRUE),
+         age_split = case_when(age_months_decimal >= age_median ~ "older",
+                               TRUE ~ "younger")) %>%
+  select(-age_median) %>% 
+  mutate(sex = ifelse(sex == "f", "F", sex)) %>% 
+  #do rest of wrangling
+  filter(!Trials.verboseTrialType %in% c("calib-short", "calib-long", "audio-test")) %>%
+  mutate(trialType = case_when(Trials.verboseTrialType %in% c("train-flip", "train") ~ "train",
+                               Trials.verboseTrialType %in% c("fam-flip", "fam") ~ "fam",
+                               Trials.verboseTrialType %in% c("unexp", "unexp-flip") ~ "unexpected",
+                               Trials.verboseTrialType %in% c("exp", "exp-flip") ~ "expected",
+                               TRUE ~ Trials.verboseTrialType)) %>%
+  group_by(SubjectInfo.subjID) %>%
+  mutate(fam_index = cumsum(trialType == "fam"),
+         train_index = cumsum(trialType == "train"),
+         exp_index = cumsum(trialType == "expected"),
+         unexp_index = cumsum(trialType == "unexpected"),
+         n_trialType = case_when(trialType == "fam" ~ str_c("fam ", fam_index),
+                                 trialType == "train" ~ str_c("train ", train_index),
+                                 trialType == "expected" ~ str_c("expected ", exp_index),
+                                 trialType == "unexpected" ~ str_c("unexpected ", unexp_index),
+                                 TRUE ~ trialType)) %>%
+  select(-fam_index, -train_index, -exp_index, -unexp_index) %>%
+  ungroup() %>%
+  mutate(n_trialType = factor(n_trialType, levels = c("train 1", "fam 1", "train 2", "fam 2", 
+                                                      "train 3", "fam 3", "train 4", "fam 4", 
+                                                      "expected 1", "unexpected 1", "expected 2", "unexpected 2")),
+         trials_famhab = factor(ifelse(n_trialType %in% c("expected 1", "unexpected 1", "expected 2", "unexpected 2"),
+                                       "test", "famhab"))) %>%
+  group_by(SubjectInfo.subjID) %>%
+  mutate(trains_n = cumsum(Trials.trialType == "train"),
+         max_trains = max(trains_n, na.rm = TRUE),
+         tests_n = cumsum(Trials.trialType == "test"),
+         max_tests = max(tests_n, na.rm = TRUE),
+         fams_n = cumsum(Trials.trialType == "fam"),
+         max_fams = max(fams_n, na.rm = TRUE)) %>%
+  ungroup()
+
+```
+
+
+## Exploratory checks
+
+```{r}
+# plot remaining train trials
+d_icatcher_plot %>% 
+  distinct(SubjectInfo.subjID, max_trains) %>% 
+  ggplot(aes(x = max_trains)) +
+  geom_histogram(binwidth = .5, aes(fill = factor(max_trains))) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5, color = "black") +
+  theme_bw() +
+  labs(title = "Distribution of train trials histogram",
+       x = "Number of train trials") +
+  theme(legend.position = "none")
+
+# Plot looking times facetted by number train trials
+d_icatcher_plot %>% 
+  mutate(max_trains = as.factor(max_trains)) %>% 
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks, fill = trials_famhab)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_point(aes(group = SubjectInfo.subjID, color = SubjectInfo.subjID), alpha = 2, size = 3) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .2, linewidth = .5) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(y = "Looking Time (secs)",
+       x = "Trial") +
+  theme(axis.text.x = element_text(angle = 90)) +
+  facet_wrap(~max_trains)
+
+# plot how many remaining TESTS trials
+d_icatcher_plot %>% 
+  distinct(SubjectInfo.subjID, max_tests) %>% 
+  ggplot(aes(x = max_tests)) +
+  geom_histogram(binwidth = .5) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5, color = "black") +
+  theme_bw() +
+  labs(x = "remaining test trials")
+```
+
+
+# Plots 
+
+## Age, Conditions
+
+```{r}
+#N
+d_icatcher_plot %>% 
+  distinct(SubjectInfo.subjID) %>% 
+  summarize(n = n())
+
+#age
+d_icatcher_plot %>% 
+  distinct(SubjectInfo.subjID, months) %>% 
+  mutate(months = factor(months)) %>% 
+  ggplot(aes(x = months, fill = months)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +  # Updated with after_stat()
+  theme_bw() +
+  scale_fill_brewer(palette = "Greens") +
+  theme(legend.position = "none") 
+
+range(d_icatcher_plot$age_months_decimal)
+mean(d_icatcher_plot$age_months_decimal)
+
+
+#sex
+d_icatcher_plot %>% 
+  distinct(SubjectInfo.subjID, sex) %>% 
+  mutate(sex = factor(sex)) %>% 
+  ggplot(aes(x = sex, fill = sex)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +  # Updated with after_stat()
+  theme_bw() +
+  scale_fill_brewer(palette = "Greens") +
+  theme(legend.position = "none") 
+
+#conditions
+d_icatcher_plot %>% 
+  distinct(SubjectInfo.subjID, condLabel) %>% 
+  mutate(condLabel = factor(condLabel)) %>% 
+  ggplot(aes(x = condLabel, fill = condLabel)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +  # Updated with after_stat()
+  theme_bw() +
+  scale_fill_brewer(palette = "Blues") +
+  theme(legend.position = "none")
+```
+
+
+## Plot all trials
+
+```{r, fig.width = 8}
+
+plot_all_trials <- d_icatcher_plot %>% 
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks, fill = trials_famhab)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_point(aes(group = SubjectInfo.subjID, color = SubjectInfo.subjID), alpha = 2, size = 3) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .2, linewidth = .5) +
+  stat_summary(fun = "mean", geom = "point", shape = 23, fill = "white", size = 3) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(y = "Looking Time (secs)",
+       x = "Trial") +
+  theme(axis.text.x = element_text(angle = 90)) 
+
+plot_all_trials 
+ 
+
+# ggsave(filename = here("figures", "iCatcher_allTrials.pdf"),
+#        width = 10,
+#        height = 6)
+
+```
+
+## Plot only test events
+
+
+```{r}
+d_icatcher_plot %>% 
+  filter(Trials.trialType == "test") %>% 
+  filter(n_trialType %in% c("unexpected 1", "expected 1")) %>% #works for msx tests of 2, 3, and 4
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_point(aes(group = SubjectInfo.subjID), alpha = .2, size = 4) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .2, linewidth = 1) +
+  #stat_summary(fun.data = "mean_se", geom = "errorbar", width = .5) +
+  stat_summary(fun = "mean", geom = "point", shape = 23, fill = "white", size = 5) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(y = "Looking Time (secs)",
+       x = "Trial") +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14)) 
+
+# mean and sd raw values
+d_icatcher_plot %>% 
+  filter(Trials.trialType == "test") %>%
+  filter(n_trialType %in% c("unexpected 1", "expected 1")) %>% #works for msx tests of 2, 3, and 4
+  group_by(trialType) %>% 
+  summarize(mean = mean(Looks.duration_onLooks), sd = sd(Looks.duration_onLooks))
+
+```
+
+
+# Exploring training effect 
+
+## median splitting training time
+
+```{r, fig.width = 10}
+d_plot <- d_icatcher_plot %>%
+  # filter(!n_trialType %in% c("expected 2", "unexpected 2")) %>%
+  group_by(SubjectInfo.subjID, Trials.trialType) %>%
+  mutate(aggregate_trial = sum(Looks.duration_onLooks)) %>%
+  ungroup() %>%
+  mutate(d_expl_short_median = median(aggregate_trial[Trials.trialType == "train"], na.rm = TRUE)) %>%
+  mutate(train_duration = ifelse(
+    Trials.trialType == "train" & aggregate_trial > d_expl_short_median,
+    "train longer than median",
+    "train shorter than median")) %>%
+  group_by(SubjectInfo.subjID) %>%
+  mutate(train_duration = first(train_duration[Trials.trialType == "train"])) %>%
+  ungroup() %>%
+  relocate(train_duration, .after = "d_expl_short_median") %>%
+  relocate(Looks.duration_onLooks, .after = "train_duration") %>%
+  relocate(aggregate_trial, .after = "Looks.duration_onLooks")
+
+d_plot %>% 
+  filter(!n_trialType %in% c("unexpected 2", "expected 2")) %>% #works for msx tests of 2, 3, and 4
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks, fill = trials_famhab)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_point(aes(group = SubjectInfo.subjID, color = SubjectInfo.subjID), alpha = 2, size = 3) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .2, linewidth = .5) +
+  stat_summary(fun = "mean", geom = "point", shape = 23, fill = "white", size = 3) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(y = "Looking Time (secs)",
+       x = "Trial") +
+  theme(axis.text.x = element_text(angle = 90)) +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        strip.text = element_text(size = 15)) +
+  facet_wrap(~train_duration)
+
+```
+# trianing effect linear model
+
+```{r}
+d_voe <- d_plot %>%
+  filter(n_trialType %in% c("expected 1", "unexpected 1")) %>%
+  group_by(SubjectInfo.subjID, n_trialType, train_duration) %>%
+  summarise(mean_looking_time = mean(Looks.duration_onLooks, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from = n_trialType,
+    values_from = mean_looking_time,
+    names_prefix = "mean_"
+  ) %>%
+  mutate(voe_effect = `mean_unexpected 1` - `mean_expected 1`)
+
+# Fit linear model: Does train_duration predict VOE effect?
+model <- lm(voe_effect ~ train_duration, data = d_voe)
+
+# Summarize the model
+summary(model)
+
+```
+
+
+## correlation between training time and voe effect
+
+```{r, fig.width = 9}
+d_plot_corr <- d_plot %>% 
+  group_by(SubjectInfo.subjID) %>%
+  mutate(aggregate_train = sum(Looks.duration_onLooks[Trials.trialType == "train"], na.rm = TRUE)) %>%
+  # mutate(aggregate_train = aggregate_trial[Trials.trialType == "train"][1]) %>% 
+  relocate(aggregate_train, .after = "aggregate_trial") %>% 
+  ungroup() %>% 
+  mutate(log_looks = log(Looks.duration_onLooks)) %>% #get log looks
+  filter(n_trialType %in% c("expected 1", "unexpected 1")) %>%
+  filter(SubjectInfo.subjID != "sub-LIU_TLAO_s049") %>% #only has 1 rem trial after filtering down
+  group_by(SubjectInfo.subjID) %>%
+  mutate(
+    log_expected_1 = max(ifelse(n_trialType == "expected 1", log_looks, NA), na.rm = TRUE),
+    log_unexpected_1 = max(ifelse(n_trialType == "unexpected 1", log_looks, NA), na.rm = TRUE),
+    logarithmic_difference = log_unexpected_1 - log_expected_1) %>%
+  ungroup()
+
+# plot
+plot_corr_training_voe <- ggplot(d_plot_corr, aes(x = aggregate_train, y = logarithmic_difference)) +
+  geom_point(aes(color = SubjectInfo.subjID)) +  
+  geom_hline(yintercept = 0, linetype = "dashed") +  
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +  
+  labs(x = "Cumulative Train Duration (Seconds)",
+       y = "Log Looking Time (Unexpected - Expected)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14))
+
+
+plot_corr_training_voe 
+
+# Fit the linear model
+# model_corr <- lm(logarithmic_difference ~ aggregate_train, data = d_plot_corr)
+
+# Summarize the results
+# summary(model_corr)
+
+```
+
+# age differences in correlations
+
+```{r, fig.width = 9}
+plot_corr_training_voe + facet_wrap(~age_split) + theme(strip.text = element_text(size = 15))
+
+model_corr <- lm(logarithmic_difference ~ aggregate_train, data = d_plot_corr)
+
+```
+
+
+## Plot all trials with median age split
+
+```{r, fig.width = 8}
+plot_all_trials <- d_icatcher_plot %>% 
+  filter(!n_trialType %in% c("unexpected 2", "expected 2")) %>% #works for msx tests of 2, 3, and 4
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks, fill = trials_famhab)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_point(aes(group = SubjectInfo.subjID, color = SubjectInfo.subjID), alpha = 2, size = 3) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .2, linewidth = .5) +
+  stat_summary(fun = "mean", geom = "point", shape = 23, fill = "white", size = 3) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(y = "Looking Time (secs)",
+       x = "Trial") +
+  theme(axis.text.x = element_text(angle = 90)) +
+  theme(legend.position = "none",
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        strip.text = element_text(size = 15)) +
+  facet_wrap(~age_split) 
+
+
+plot_all_trials 
+
+# ggsave(filename = here("figures", "iCatcher_allTrials.pdf"),
+#        width = 10,
+#        height = 6)
+
+```
+
+## Plot test trials
+
+```{r}
+plot_test_trials <- d_icatcher_plot %>% 
+  filter(trials_famhab != "famhab") %>% 
+  filter(!n_trialType %in% c("unexpected 2", "expected 2")) %>% #works for msx tests of 2, 3, and 4
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks)) +
+  geom_boxplot(aes(fill = trialType), outliers = FALSE) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .1, linewidth = .5) +
+  geom_point(aes(group = SubjectInfo.subjID, color = SubjectInfo.subjID), alpha = .6, size = 4) +
+  stat_summary(fun = mean, geom = "point", shape = 23, fill = "white", size = 4) +
+  theme_bw() +
+  labs(y = "Looking Time",
+       x = "Trial") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        strip.text = element_text(size = 15)) +
+  facet_wrap(~age_split)
+
+plot_test_trials
+
+# ggsave(filename = here("figures", "iCatcher_allTests.pdf"))
+
+```
+
+## Plot test trials by condition
+
+```{r, fig.width = 8, fig.height = 6}
+d_icatcher_plot %>% 
+  filter(trials_famhab != "famhab") %>% 
+  mutate(condition = case_when(condLabel == 1 ~ "1: fam-flip last <-, exp-flip first ->",
+                               condLabel == 2 ~ "2: fam last ->, unexp first ->",
+                               condLabel == 3 ~ "3: fam last ->, unexp-flip first <-",
+                               condLabel == 4 ~ "4: fam-flip last <-, exp first <-")) %>% 
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks)) +
+  geom_boxplot(aes(fill = trialType), outliers = FALSE) +
+  geom_point(aes(group = SubjectInfo.subjID), alpha = .2, size = 4) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .2, linewidth = .5) +
+  stat_summary(fun = mean, geom = "point", shape = 23, fill = "white", size = 4) +
+  theme_bw() +
+  labs(y = "Looking Time",
+       x = "Trial") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 12)) +
+  facet_wrap(vars(condition)) + 
+  theme(axis.text.x = element_text(angle = 90))
+
+```
+
+## conditions again, different labels
+
+
+```{r}
+d_icatcher_plot %>% 
+  filter(trials_famhab != "famhab") %>% 
+  filter(!n_trialType %in% c("unexpected 2", "expected 2")) %>% 
+  mutate(condition = case_when(condLabel %in% c(1, 4) ~ "expected first", #cond 1 and 4
+                               TRUE ~ "unexpected first")) %>% #cond 2 and 3
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks)) +
+  geom_boxplot(aes(fill = trialType), outliers = FALSE) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .1, linewidth = .5) +
+  geom_point(aes(group = SubjectInfo.subjID, color = SubjectInfo.subjID), alpha = .6, size = 4) +
+  stat_summary(fun = mean, geom = "point", shape = 23, fill = "white", size = 4) +
+  theme_bw() +
+  labs(y = "Looking Time (seconds)",
+       x = "Trial") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 12),
+        strip.text = element_text(size = 15)) +
+  facet_wrap(vars(condition)) 
+
+# ggsave(filename = here("figures", "iCatcher_allTests.pdf"))
+
+```
+
+## Plot first test pair
+
+```{r}
+d_icatcher_plot_first_pair <- d_icatcher_plot %>% 
+  filter(!(Trials.ordinal %in% c(13, 14)))
+
+plot_first_test_pair <- d_icatcher_plot_first_pair %>% 
+  filter(trials_famhab != "famhab") %>% 
+  # filter(n_trialType %in% c("unexpected 1", "expected 1")) %>% 
+  ggplot(aes(x = n_trialType, y = Looks.duration_onLooks)) +
+  geom_boxplot(aes(fill = n_trialType), outliers = FALSE) +
+  geom_line(aes(group = SubjectInfo.subjID), alpha = .2, linewidth = .5) +
+  geom_point(aes(group = SubjectInfo.subjID, color = SubjectInfo.subjID), alpha = .6, size = 4) +
+  stat_summary(fun = mean, geom = "point", shape = 23, fill = "white", size = 4) +
+  theme_bw() +
+  labs(y = "Looking Time (Seconds)",
+       x = "Trial") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 12),
+        axis.title.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 12))
+
+plot_first_test_pair
+
+## ggsave(filename = here("figures", "iCatcher_firstTestPair.pdf"))
+```
+
+# Statistical analysis
+
+```{r, echo = TRUE, fig.width = 8, fig.height = 6}
+d_icatcher_stats <- d_icatcher_plot_first_pair %>% 
+  filter(Trials.trialType == "test") %>% 
+  mutate(order = ifelse(condLabel %in% c(1, 4), "expected_first", "unexpected_first")) %>% 
+  filter(!is.nan(Log_looks) & !is.infinite(Log_looks)) %>% 
+  mutate(Index = row_number())
+
+model <- lmer(Looks.duration_onLooks ~ trialType + (1 | SubjectInfo.subjID), data = d_icatcher_stats)
+summary(model)
+
+performance::check_model(model)
+
+```
+
+#with log-transformation
+
+```{r, echo = TRUE, fig.width = 8, fig.height = 6}
+model_log <- lmer(Log_looks ~ trialType + (1 | SubjectInfo.subjID) + age_months_decimal + order, data = d_icatcher_stats)
+summary(model_log)
+
+performance::check_model(model_log)
+
+```
+
+
+
+
+
+
